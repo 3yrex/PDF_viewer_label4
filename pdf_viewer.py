@@ -5,7 +5,7 @@ Features:
 - Display a PDF in a GUI (tkinter + PyMuPDF)
 - Zoom and pan support
 - Page navigation (buttons or configurable keyboard shortcuts)
-- Label shortcuts: configurable (default 1 = unwichtig, 2 = wichtig, 3 = sehr wichtig)
+- Label shortcuts: configurable (default 1 = unwichtig, 2 = wichtig, 3 = sehr wichtig, 4 = ?)
 - Auto-advance to next page after labeling
 - Auto-save labels in the background after every N labels (configurable, default 3)
 - Save / load label progress (JSON)
@@ -53,6 +53,7 @@ LABELS = {
     1: "unwichtig",
     2: "wichtig",
     3: "sehr wichtig",
+    4: "?",
 }
 
 LABEL_COLORS = {
@@ -60,6 +61,7 @@ LABEL_COLORS = {
     1: DR_RED,       # unwichtig  → red
     2: DR_ORANGE,    # wichtig    → orange
     3: DR_GREEN,     # sehr wichtig → green
+    4: DR_CYAN,      # ?          → cyan
 }
 
 ZOOM_STEP = 0.25
@@ -75,6 +77,7 @@ DEFAULT_SHORTCUTS: dict[str, str] = {
     "label_1":    "1",
     "label_2":    "2",
     "label_3":    "3",
+    "label_4":    "4",
     "zoom_in":    "<plus>",
     "zoom_out":   "<minus>",
 }
@@ -87,6 +90,7 @@ SHORTCUT_LABELS: dict[str, str] = {
     "label_1":    "Label: unwichtig",
     "label_2":    "Label: wichtig",
     "label_3":    "Label: sehr wichtig",
+    "label_4":    'Label: "?"',
     "zoom_in":    "Zoom +",
     "zoom_out":   "Zoom −",
 }
@@ -273,6 +277,7 @@ class PDFViewer(tk.Tk):
             (1, "Unwichtig",      LABEL_COLORS[1]),
             (2, "Wichtig",        LABEL_COLORS[2]),
             (3, "Sehr wichtig",   LABEL_COLORS[3]),
+            (4, "Fraglich (?)",   LABEL_COLORS[4]),
         ]:
             row = tk.Frame(stats_outer, bg=DR_SURFACE)
             row.pack(fill=tk.X, pady=1)
@@ -367,6 +372,7 @@ class PDFViewer(tk.Tk):
         bind(self.shortcuts["label_1"],    lambda: self._set_label(1))
         bind(self.shortcuts["label_2"],    lambda: self._set_label(2))
         bind(self.shortcuts["label_3"],    lambda: self._set_label(3))
+        bind(self.shortcuts["label_4"],    lambda: self._set_label(4))
         bind(self.shortcuts["zoom_in"],    self._zoom_in)
         bind(self.shortcuts["zoom_out"],   self._zoom_out)
         # Numpad keys are fixed (not configurable)
@@ -643,6 +649,33 @@ class PDFViewer(tk.Tk):
         self.labels = {}
         self.zoom = DEFAULT_ZOOM
         self.title(f"PDF Viewer – {os.path.basename(path)}")
+
+        # Auto-load labels if a matching JSON file exists next to the PDF
+        json_path = os.path.splitext(path)[0] + "_labels.json"
+        if os.path.isfile(json_path):
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self.labels = {int(k): int(v) for k, v in data.get("labels", {}).items()}
+                # Jump to the first unlabeled page so the user can continue
+                total_pages = len(self.doc)
+                for page_idx in range(total_pages):
+                    if page_idx not in self.labels:
+                        self.current_page = page_idx
+                        break
+                n = len(self.labels)
+                fname = os.path.basename(json_path)
+                self.autosave_label.config(
+                    text=f"✔ {n} Label(s) aus {fname} geladen"
+                )
+                self.after(3000, lambda: self.autosave_label.config(text=""))
+            except (json.JSONDecodeError, KeyError, ValueError, OSError):
+                self.labels = {}
+                self.autosave_label.config(
+                    text="⚠ Labels konnten nicht geladen werden", fg=DR_ORANGE
+                )
+                self.after(4000, lambda: self.autosave_label.config(text="", fg=DR_GREEN))
+
         self._rebuild_sidebar()
         self._show_page()
 
@@ -794,7 +827,7 @@ class PDFViewer(tk.Tk):
                 lbl.config(text="–")
             return
         total = len(self.doc)
-        counts: dict[int, int] = {0: 0, 1: 0, 2: 0, 3: 0}
+        counts: dict[int, int] = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0}
         for i in range(total):
             counts[self.labels.get(i, 0)] += 1
         for key, lbl in self._stat_count_labels.items():
@@ -809,7 +842,7 @@ class PDFViewer(tk.Tk):
         muted_fg = self._adapt_fg(lb_bg, DR_COMMENT)
         for i in range(len(self.doc)):
             lbl_key = self.labels.get(i, 0)
-            prefix = {0: "  ", 1: "✗ ", 2: "★ ", 3: "★★"}[lbl_key]
+            prefix = {0: "  ", 1: "✗ ", 2: "★ ", 3: "★★", 4: "? "}[lbl_key]
             color = LABEL_COLORS[lbl_key]
             entry = f"{prefix}Seite {i + 1}"
             self.page_listbox.insert(tk.END, entry)
@@ -853,7 +886,7 @@ class PDFViewer(tk.Tk):
         self._update_status()
         # Update sidebar entry color/prefix
         lbl_key = self.labels.get(self.current_page, 0)
-        prefix = {0: "  ", 1: "✗ ", 2: "★ ", 3: "★★"}[lbl_key]
+        prefix = {0: "  ", 1: "✗ ", 2: "★ ", 3: "★★", 4: "? "}[lbl_key]
         self.page_listbox.delete(self.current_page)
         self.page_listbox.insert(self.current_page, f"{prefix}Seite {self.current_page + 1}")
         color = LABEL_COLORS[lbl_key]
@@ -945,7 +978,7 @@ class PDFViewer(tk.Tk):
         dlg = tk.Toplevel(self)
         dlg.title("Shortcuts konfigurieren")
         dlg.configure(bg=DR_BG)
-        dlg.geometry("420x370")
+        dlg.geometry("420x400")
         dlg.resizable(False, False)
         dlg.transient(self)
         dlg.grab_set()

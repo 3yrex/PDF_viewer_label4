@@ -7,10 +7,13 @@ Features:
 - Page navigation (buttons or configurable keyboard shortcuts)
 - Label shortcuts: configurable (default 1 = unwichtig, 2 = wichtig, 3 = sehr wichtig)
 - Auto-advance to next page after labeling
+- Auto-save labels in the background after every N labels (configurable, default 3)
 - Save / load label progress (JSON)
 - Extract pages labeled "wichtig" or "sehr wichtig" to a new PDF
 - Page statistics panel (unlabeled / unwichtig / wichtig / sehr wichtig counts)
 - Configurable keyboard shortcuts dialog
+- Configurable settings dialog (auto-save threshold)
+- Dracula Theme color scheme, JetBrains Mono font
 """
 
 import json
@@ -23,6 +26,25 @@ from PIL import Image, ImageTk
 
 # ── Constants ───────────────────────────────────────────────────────────────
 
+# ── Dracula Theme Official palette ──────────────────────────────────────────
+DR_BG        = "#282A36"   # Background
+DR_SURFACE   = "#44475A"   # Current Line / panels
+DR_FG        = "#F8F8F2"   # Foreground
+DR_COMMENT   = "#6272A4"   # Comments / muted text
+DR_CYAN      = "#8BE9FD"
+DR_GREEN     = "#50FA7B"
+DR_ORANGE    = "#FFB86C"
+DR_PINK      = "#FF79C6"
+DR_PURPLE    = "#BD93F9"
+DR_RED       = "#FF5555"
+DR_YELLOW    = "#F1FA8C"
+
+# Font
+FONT_FAMILY = "JetBrains Mono"
+
+# Auto-save
+DEFAULT_AUTO_SAVE_THRESHOLD = 3   # save after every N labels
+
 LABELS = {
     0: "",           # unlabeled
     1: "unwichtig",
@@ -31,10 +53,10 @@ LABELS = {
 }
 
 LABEL_COLORS = {
-    0: "#cccccc",
-    1: "#f28b82",   # soft red  → unimportant
-    2: "#fbbc04",   # amber     → important
-    3: "#34a853",   # green     → very important
+    0: DR_COMMENT,   # unlabeled  → muted purple-grey
+    1: DR_RED,       # unwichtig  → red
+    2: DR_ORANGE,    # wichtig    → orange
+    3: DR_GREEN,     # sehr wichtig → green
 }
 
 ZOOM_STEP = 0.25
@@ -74,7 +96,7 @@ class PDFViewer(tk.Tk):
         super().__init__()
         self.title("PDF Viewer mit Labels")
         self.geometry("1200x800")
-        self.configure(bg="#2b2b2b")
+        self.configure(bg=DR_BG)
 
         # State
         self.pdf_path: str = ""
@@ -86,6 +108,9 @@ class PDFViewer(tk.Tk):
         self._bound_key_sequences: list[str] = []
         self._resize_job = None   # debounce handle for canvas resize
         self._is_fullscreen: bool = False
+        # Auto-save
+        self.auto_save_threshold: int = DEFAULT_AUTO_SAVE_THRESHOLD
+        self._labels_since_last_save: int = 0
 
         self._build_ui()
         self._bind_keys()
@@ -94,11 +119,12 @@ class PDFViewer(tk.Tk):
 
     def _build_ui(self):
         # ── Top toolbar ──────────────────────────────────────────────────────
-        toolbar = tk.Frame(self, bg="#3c3f41", pady=4)
+        toolbar = tk.Frame(self, bg=DR_SURFACE, pady=4)
         toolbar.pack(side=tk.TOP, fill=tk.X)
 
-        btn_cfg = {"bg": "#4c5052", "fg": "white", "relief": tk.FLAT,
-                   "padx": 8, "pady": 4, "cursor": "hand2"}
+        btn_cfg = {"bg": DR_COMMENT, "fg": DR_FG, "relief": tk.FLAT,
+                   "padx": 8, "pady": 4, "cursor": "hand2",
+                   "font": (FONT_FAMILY, 9)}
 
         tk.Button(toolbar, text="📂 PDF öffnen", command=self._open_pdf,
                   **btn_cfg).pack(side=tk.LEFT, padx=4)
@@ -110,7 +136,7 @@ class PDFViewer(tk.Tk):
                   command=self._export_important, **btn_cfg).pack(side=tk.LEFT, padx=2)
 
         # Separator
-        tk.Label(toolbar, text="  ", bg="#3c3f41").pack(side=tk.LEFT)
+        tk.Label(toolbar, text="  ", bg=DR_SURFACE).pack(side=tk.LEFT)
 
         # Zoom controls
         tk.Button(toolbar, text="🔍 +", command=self._zoom_in,
@@ -120,26 +146,40 @@ class PDFViewer(tk.Tk):
         tk.Button(toolbar, text="⟳ Reset Zoom", command=self._zoom_reset,
                   **btn_cfg).pack(side=tk.LEFT, padx=2)
         self.zoom_label = tk.Label(toolbar, text=f"{int(DEFAULT_ZOOM*100)} %",
-                                   bg="#3c3f41", fg="#aaaaaa", width=6)
+                                   bg=DR_SURFACE, fg=DR_COMMENT,
+                                   font=(FONT_FAMILY, 9), width=6)
         self.zoom_label.pack(side=tk.LEFT, padx=4)
 
         # Separator
-        tk.Label(toolbar, text="|", bg="#3c3f41", fg="#555555").pack(side=tk.LEFT, padx=4)
+        tk.Label(toolbar, text="|", bg=DR_SURFACE, fg=DR_COMMENT).pack(side=tk.LEFT, padx=4)
 
         # Editable page navigation
-        tk.Label(toolbar, text="Seite:", bg="#3c3f41", fg="#aaaaaa").pack(side=tk.LEFT, padx=(2, 1))
+        tk.Label(toolbar, text="Seite:", bg=DR_SURFACE, fg=DR_COMMENT,
+                 font=(FONT_FAMILY, 9)).pack(side=tk.LEFT, padx=(2, 1))
         self.page_entry = tk.Entry(
-            toolbar, width=4, justify="center", bg="#4c5052", fg="white",
-            insertbackground="white", relief=tk.FLAT, font=("Helvetica", 10)
+            toolbar, width=4, justify="center", bg=DR_COMMENT, fg=DR_FG,
+            insertbackground=DR_FG, relief=tk.FLAT, font=(FONT_FAMILY, 9)
         )
         self.page_entry.pack(side=tk.LEFT, padx=1)
         self.page_entry.bind("<Return>", self._on_page_entry)
-        self.page_total_label = tk.Label(toolbar, text="/ --", bg="#3c3f41", fg="#aaaaaa")
+        self.page_total_label = tk.Label(toolbar, text="/ --", bg=DR_SURFACE,
+                                         fg=DR_COMMENT, font=(FONT_FAMILY, 9))
         self.page_total_label.pack(side=tk.LEFT, padx=(1, 8))
 
         # Shortcuts config button
-        tk.Button(toolbar, text="⚙ Shortcuts", command=self._open_shortcuts_dialog,
+        tk.Button(toolbar, text="⌨ Shortcuts", command=self._open_shortcuts_dialog,
                   **btn_cfg).pack(side=tk.LEFT, padx=2)
+
+        # Settings button (auto-save threshold etc.)
+        tk.Button(toolbar, text="⚙ Einstellungen", command=self._open_settings_dialog,
+                  **btn_cfg).pack(side=tk.LEFT, padx=2)
+
+        # Auto-save indicator
+        self.autosave_label = tk.Label(
+            toolbar, text="", bg=DR_SURFACE, fg=DR_GREEN,
+            font=(FONT_FAMILY, 9)
+        )
+        self.autosave_label.pack(side=tk.LEFT, padx=4)
 
         # Fullscreen toggle button
         self.fullscreen_btn = tk.Button(
@@ -149,57 +189,57 @@ class PDFViewer(tk.Tk):
         self.fullscreen_btn.pack(side=tk.LEFT, padx=2)
 
         # ── Status bar (bottom) ──────────────────────────────────────────────
-        status_bar = tk.Frame(self, bg="#3c3f41", pady=3)
+        status_bar = tk.Frame(self, bg=DR_SURFACE, pady=3)
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
-        self.label_badge = tk.Label(status_bar, text="", bg="#3c3f41",
-                                    fg="white", font=("Helvetica", 11, "bold"),
+        self.label_badge = tk.Label(status_bar, text="", bg=DR_SURFACE,
+                                    fg=DR_FG, font=(FONT_FAMILY, 11, "bold"),
                                     width=14, anchor="center")
         self.label_badge.pack(side=tk.LEFT, padx=8)
 
         # Shortcut hint
         hint = (
-            "Shortcuts konfigurierbar (⚙ Shortcuts)  |  "
+            "Shortcuts konfigurierbar (⌨ Shortcuts)  |  "
             "Mausrad = Scrollen  |  Strg+Mausrad = Zoom  |  "
             "Mitteltaste/Rechtstaste + Ziehen = Verschieben  |  "
             "F11 = Vollbild"
         )
-        tk.Label(status_bar, text=hint, bg="#3c3f41", fg="#888888",
-                 font=("Helvetica", 9)).pack(side=tk.RIGHT, padx=8)
+        tk.Label(status_bar, text=hint, bg=DR_SURFACE, fg=DR_COMMENT,
+                 font=(FONT_FAMILY, 9)).pack(side=tk.RIGHT, padx=8)
 
         # ── Main area: canvas + sidebar ──────────────────────────────────────
-        main = tk.Frame(self, bg="#2b2b2b")
+        main = tk.Frame(self, bg=DR_BG)
         main.pack(fill=tk.BOTH, expand=True)
 
         # Sidebar (page list + statistics + navigation)
-        sidebar = tk.Frame(main, bg="#313335", width=220)
+        sidebar = tk.Frame(main, bg=DR_SURFACE, width=220)
         sidebar.pack(side=tk.RIGHT, fill=tk.Y)
         sidebar.pack_propagate(False)
 
-        tk.Label(sidebar, text="Seiten", bg="#313335", fg="#aaaaaa",
-                 font=("Helvetica", 11, "bold")).pack(pady=(8, 4))
+        tk.Label(sidebar, text="Seiten", bg=DR_SURFACE, fg=DR_COMMENT,
+                 font=(FONT_FAMILY, 11, "bold")).pack(pady=(8, 4))
 
         # Page list box
-        list_frame = tk.Frame(sidebar, bg="#313335")
+        list_frame = tk.Frame(sidebar, bg=DR_SURFACE)
         list_frame.pack(fill=tk.BOTH, expand=True, padx=4)
 
         sb_scroll = tk.Scrollbar(list_frame)
         sb_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
         self.page_listbox = tk.Listbox(
-            list_frame, bg="#2b2b2b", fg="white", selectbackground="#4a6fa5",
-            activestyle="none", font=("Helvetica", 10), yscrollcommand=sb_scroll.set
+            list_frame, bg=DR_BG, fg=DR_FG, selectbackground=DR_PURPLE,
+            activestyle="none", font=(FONT_FAMILY, 9), yscrollcommand=sb_scroll.set
         )
         self.page_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb_scroll.config(command=self.page_listbox.yview)
         self.page_listbox.bind("<<ListboxSelect>>", self._on_listbox_select)
 
         # Statistics panel
-        tk.Frame(sidebar, bg="#555555", height=1).pack(fill=tk.X, padx=4, pady=(4, 0))
-        stats_outer = tk.Frame(sidebar, bg="#313335")
+        tk.Frame(sidebar, bg=DR_COMMENT, height=1).pack(fill=tk.X, padx=4, pady=(4, 0))
+        stats_outer = tk.Frame(sidebar, bg=DR_SURFACE)
         stats_outer.pack(fill=tk.X, padx=6, pady=4)
-        tk.Label(stats_outer, text="Statistik", bg="#313335", fg="#aaaaaa",
-                 font=("Helvetica", 10, "bold")).pack(anchor="w", pady=(2, 4))
+        tk.Label(stats_outer, text="Statistik", bg=DR_SURFACE, fg=DR_COMMENT,
+                 font=(FONT_FAMILY, 10, "bold")).pack(anchor="w", pady=(2, 4))
         self._stat_count_labels: dict[int, tk.Label] = {}
         for key, name, color in [
             (0, "Nicht gelabelt", LABEL_COLORS[0]),
@@ -207,30 +247,32 @@ class PDFViewer(tk.Tk):
             (2, "Wichtig",        LABEL_COLORS[2]),
             (3, "Sehr wichtig",   LABEL_COLORS[3]),
         ]:
-            row = tk.Frame(stats_outer, bg="#313335")
+            row = tk.Frame(stats_outer, bg=DR_SURFACE)
             row.pack(fill=tk.X, pady=1)
-            tk.Label(row, text="●", fg=color, bg="#313335",
-                     font=("Helvetica", 9)).pack(side=tk.LEFT)
-            tk.Label(row, text=f" {name}:", bg="#313335", fg="#aaaaaa",
-                     font=("Helvetica", 9), anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
-            count_lbl = tk.Label(row, text="–", bg="#313335", fg="white",
-                                 font=("Helvetica", 9, "bold"), width=4, anchor="e")
+            tk.Label(row, text="●", fg=color, bg=DR_SURFACE,
+                     font=(FONT_FAMILY, 9)).pack(side=tk.LEFT)
+            tk.Label(row, text=f" {name}:", bg=DR_SURFACE, fg=DR_COMMENT,
+                     font=(FONT_FAMILY, 9), anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
+            count_lbl = tk.Label(row, text="–", bg=DR_SURFACE, fg=DR_FG,
+                                 font=(FONT_FAMILY, 9, "bold"), width=4, anchor="e")
             count_lbl.pack(side=tk.RIGHT)
             self._stat_count_labels[key] = count_lbl
-        tk.Frame(sidebar, bg="#555555", height=1).pack(fill=tk.X, padx=4, pady=(0, 4))
+        tk.Frame(sidebar, bg=DR_COMMENT, height=1).pack(fill=tk.X, padx=4, pady=(0, 4))
 
         # Navigation buttons
-        nav = tk.Frame(sidebar, bg="#313335")
+        nav = tk.Frame(sidebar, bg=DR_SURFACE)
         nav.pack(pady=6)
         tk.Button(nav, text="◀ Zurück", command=self._prev_page,
-                  bg="#4c5052", fg="white", relief=tk.FLAT,
-                  padx=6, cursor="hand2").pack(side=tk.LEFT, padx=4)
+                  bg=DR_COMMENT, fg=DR_FG, relief=tk.FLAT,
+                  padx=6, cursor="hand2",
+                  font=(FONT_FAMILY, 9)).pack(side=tk.LEFT, padx=4)
         tk.Button(nav, text="Weiter ▶", command=self._next_page,
-                  bg="#4c5052", fg="white", relief=tk.FLAT,
-                  padx=6, cursor="hand2").pack(side=tk.LEFT, padx=4)
+                  bg=DR_COMMENT, fg=DR_FG, relief=tk.FLAT,
+                  padx=6, cursor="hand2",
+                  font=(FONT_FAMILY, 9)).pack(side=tk.LEFT, padx=4)
 
         # ── PDF canvas with scrollbars ───────────────────────────────────────
-        canvas_frame = tk.Frame(main, bg="#2b2b2b")
+        canvas_frame = tk.Frame(main, bg=DR_BG)
         canvas_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         h_scroll = tk.Scrollbar(canvas_frame, orient=tk.HORIZONTAL)
@@ -240,7 +282,7 @@ class PDFViewer(tk.Tk):
 
         self.canvas = tk.Canvas(
             canvas_frame,
-            bg="#525659",
+            bg=DR_SURFACE,
             xscrollcommand=h_scroll.set,
             yscrollcommand=v_scroll.set,
             highlightthickness=0,
@@ -491,9 +533,9 @@ class PDFViewer(tk.Tk):
         lbl_text = LABELS[lbl_key]
         color = LABEL_COLORS[lbl_key]
         if lbl_key == 0:
-            self.label_badge.config(text="[kein Label]", bg="#3c3f41", fg="#888888")
+            self.label_badge.config(text="[kein Label]", bg=DR_SURFACE, fg=DR_COMMENT)
         else:
-            self.label_badge.config(text=f"[{lbl_text}]", bg=color, fg="white")
+            self.label_badge.config(text=f"[{lbl_text}]", bg=color, fg=DR_BG)
         self.zoom_label.config(text=f"{int(self.zoom * 100)} %")
 
     # ── Sidebar helpers ──────────────────────────────────────────────────────
@@ -522,7 +564,7 @@ class PDFViewer(tk.Tk):
             color = LABEL_COLORS[lbl_key]
             entry = f"{prefix}Seite {i + 1}"
             self.page_listbox.insert(tk.END, entry)
-            self.page_listbox.itemconfig(i, fg=color if lbl_key else "#aaaaaa")
+            self.page_listbox.itemconfig(i, fg=color if lbl_key else DR_COMMENT)
         self._update_stats()
 
     def _update_sidebar_selection(self):
@@ -566,11 +608,41 @@ class PDFViewer(tk.Tk):
         self.page_listbox.delete(self.current_page)
         self.page_listbox.insert(self.current_page, f"{prefix}Seite {self.current_page + 1}")
         color = LABEL_COLORS[lbl_key]
-        self.page_listbox.itemconfig(self.current_page, fg=color if lbl_key else "#aaaaaa")
+        self.page_listbox.itemconfig(self.current_page, fg=color if lbl_key else DR_COMMENT)
         self._update_sidebar_selection()
         self._update_stats()
+        # Auto-save counter: only count actual label assignments (not removals)
+        if lbl_key != 0:
+            self._labels_since_last_save += 1
+            if self._labels_since_last_save >= self.auto_save_threshold:
+                self._auto_save()
         # Auto-advance to next page after labeling
         self._next_page()
+
+    # ── Auto-save ─────────────────────────────────────────────────────────────
+
+    def _auto_save(self):
+        """Silently save labels to the default path next to the PDF file."""
+        if not self.pdf_path or not self.labels:
+            return
+        path = os.path.splitext(self.pdf_path)[0] + "_labels.json"
+        data = {
+            "pdf": os.path.basename(self.pdf_path),
+            "labels": {str(k): v for k, v in self.labels.items()},
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            self._labels_since_last_save = 0
+            # Brief indicator in the toolbar
+            self.autosave_label.config(text="✔ Automatisch gespeichert")
+            self.after(3000, lambda: self.autosave_label.config(text=""))
+        except OSError:
+            # Show a brief error hint without interrupting the workflow
+            self.autosave_label.config(
+                text="⚠ Auto-Speichern fehlgeschlagen", fg=DR_ORANGE
+            )
+            self.after(4000, lambda: self.autosave_label.config(text="", fg=DR_GREEN))
 
     # ── Zoom ─────────────────────────────────────────────────────────────────
 
@@ -621,7 +693,7 @@ class PDFViewer(tk.Tk):
     def _open_shortcuts_dialog(self):
         dlg = tk.Toplevel(self)
         dlg.title("Shortcuts konfigurieren")
-        dlg.configure(bg="#2b2b2b")
+        dlg.configure(bg=DR_BG)
         dlg.geometry("420x370")
         dlg.resizable(False, False)
         dlg.transient(self)
@@ -631,21 +703,22 @@ class PDFViewer(tk.Tk):
         key_buttons: dict[str, tk.Button] = {}
         waiting: list[str | None] = [None]
 
-        tk.Label(dlg, text="Shortcuts konfigurieren", bg="#2b2b2b", fg="white",
-                 font=("Helvetica", 12, "bold")).pack(pady=(12, 8))
+        tk.Label(dlg, text="Shortcuts konfigurieren", bg=DR_BG, fg=DR_FG,
+                 font=(FONT_FAMILY, 12, "bold")).pack(pady=(12, 8))
 
-        frame = tk.Frame(dlg, bg="#2b2b2b")
+        frame = tk.Frame(dlg, bg=DR_BG)
         frame.pack(fill=tk.BOTH, expand=True, padx=16)
 
-        btn_cfg_dlg = dict(bg="#4c5052", fg="white", relief=tk.FLAT,
-                           padx=6, pady=2, cursor="hand2", width=14)
+        btn_cfg_dlg = dict(bg=DR_COMMENT, fg=DR_FG, relief=tk.FLAT,
+                           padx=6, pady=2, cursor="hand2", width=14,
+                           font=(FONT_FAMILY, 9))
 
         def start_capture(action: str) -> None:
             # Cancel any ongoing capture
             if waiting[0]:
-                key_buttons[waiting[0]].config(text=temp[waiting[0]], bg="#4c5052")
+                key_buttons[waiting[0]].config(text=temp[waiting[0]], bg=DR_COMMENT)
             waiting[0] = action
-            key_buttons[action].config(text="[Taste drücken…]", bg="#5a7fa5")
+            key_buttons[action].config(text="[Taste drücken…]", bg=DR_PURPLE)
             dlg.bind("<Key>", capture_key)
 
         def capture_key(event: tk.Event) -> None:
@@ -655,15 +728,15 @@ class PDFViewer(tk.Tk):
             key = event.keysym
             binding = key if len(key) == 1 else f"<{key}>"
             temp[action] = binding
-            key_buttons[action].config(text=binding, bg="#4c5052")
+            key_buttons[action].config(text=binding, bg=DR_COMMENT)
             waiting[0] = None
             dlg.unbind("<Key>")
 
         for action, label in SHORTCUT_LABELS.items():
-            row = tk.Frame(frame, bg="#2b2b2b")
+            row = tk.Frame(frame, bg=DR_BG)
             row.pack(fill=tk.X, pady=2)
-            tk.Label(row, text=label, bg="#2b2b2b", fg="#aaaaaa",
-                     font=("Helvetica", 10), width=24, anchor="w").pack(side=tk.LEFT)
+            tk.Label(row, text=label, bg=DR_BG, fg=DR_COMMENT,
+                     font=(FONT_FAMILY, 10), width=24, anchor="w").pack(side=tk.LEFT)
             btn = tk.Button(row, text=temp[action],
                             command=lambda a=action: start_capture(a),
                             **btn_cfg_dlg)
@@ -680,17 +753,72 @@ class PDFViewer(tk.Tk):
                 temp[action] = DEFAULT_SHORTCUTS[action]
                 key_buttons[action].config(text=DEFAULT_SHORTCUTS[action])
 
-        btn_row = tk.Frame(dlg, bg="#2b2b2b")
+        btn_row = tk.Frame(dlg, bg=DR_BG)
         btn_row.pack(pady=8)
         tk.Button(btn_row, text="Speichern", command=on_save,
-                  bg="#34a853", fg="white", relief=tk.FLAT, padx=10, pady=4,
-                  cursor="hand2").pack(side=tk.LEFT, padx=6)
+                  bg=DR_GREEN, fg=DR_BG, relief=tk.FLAT, padx=10, pady=4,
+                  cursor="hand2", font=(FONT_FAMILY, 9)).pack(side=tk.LEFT, padx=6)
         tk.Button(btn_row, text="Standard", command=on_reset,
-                  bg="#4c5052", fg="white", relief=tk.FLAT, padx=10, pady=4,
-                  cursor="hand2").pack(side=tk.LEFT, padx=6)
+                  bg=DR_COMMENT, fg=DR_FG, relief=tk.FLAT, padx=10, pady=4,
+                  cursor="hand2", font=(FONT_FAMILY, 9)).pack(side=tk.LEFT, padx=6)
         tk.Button(btn_row, text="Abbrechen", command=dlg.destroy,
-                  bg="#f28b82", fg="white", relief=tk.FLAT, padx=10, pady=4,
-                  cursor="hand2").pack(side=tk.LEFT, padx=6)
+                  bg=DR_RED, fg=DR_BG, relief=tk.FLAT, padx=10, pady=4,
+                  cursor="hand2", font=(FONT_FAMILY, 9)).pack(side=tk.LEFT, padx=6)
+
+    # ── Settings dialog ──────────────────────────────────────────────────────
+
+    def _open_settings_dialog(self):
+        """Dialog for configuring application settings (e.g. auto-save threshold)."""
+        dlg = tk.Toplevel(self)
+        dlg.title("Einstellungen")
+        dlg.configure(bg=DR_BG)
+        dlg.geometry("340x180")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        tk.Label(dlg, text="Einstellungen", bg=DR_BG, fg=DR_FG,
+                 font=(FONT_FAMILY, 12, "bold")).pack(pady=(12, 8))
+
+        frame = tk.Frame(dlg, bg=DR_BG)
+        frame.pack(fill=tk.BOTH, expand=True, padx=16)
+
+        # Auto-save threshold row
+        row = tk.Frame(frame, bg=DR_BG)
+        row.pack(fill=tk.X, pady=6)
+        tk.Label(row, text="Auto-Speichern nach N Labels:", bg=DR_BG, fg=DR_COMMENT,
+                 font=(FONT_FAMILY, 10), anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
+        threshold_var = tk.StringVar(value=str(self.auto_save_threshold))
+        spinbox = tk.Spinbox(
+            row, from_=1, to=100, textvariable=threshold_var,
+            width=5, bg=DR_COMMENT, fg=DR_FG, buttonbackground=DR_COMMENT,
+            insertbackground=DR_FG, relief=tk.FLAT, font=(FONT_FAMILY, 10),
+        )
+        spinbox.pack(side=tk.LEFT, padx=4)
+
+        def on_save() -> None:
+            try:
+                val = int(threshold_var.get())
+                if val < 1:
+                    raise ValueError("Auto-save threshold must be at least 1")
+                self.auto_save_threshold = val
+            except ValueError:
+                messagebox.showerror(
+                    "Ungültiger Wert",
+                    "Bitte eine ganze Zahl ≥ 1 eingeben.",
+                    parent=dlg,
+                )
+                return
+            dlg.destroy()
+
+        btn_row = tk.Frame(dlg, bg=DR_BG)
+        btn_row.pack(pady=8)
+        tk.Button(btn_row, text="Speichern", command=on_save,
+                  bg=DR_GREEN, fg=DR_BG, relief=tk.FLAT, padx=10, pady=4,
+                  cursor="hand2", font=(FONT_FAMILY, 9)).pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_row, text="Abbrechen", command=dlg.destroy,
+                  bg=DR_RED, fg=DR_BG, relief=tk.FLAT, padx=10, pady=4,
+                  cursor="hand2", font=(FONT_FAMILY, 9)).pack(side=tk.LEFT, padx=6)
 
 
 # ── Entry point ──────────────────────────────────────────────────────────────

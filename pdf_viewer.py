@@ -85,6 +85,7 @@ class PDFViewer(tk.Tk):
         self.shortcuts: dict[str, str] = dict(DEFAULT_SHORTCUTS)
         self._bound_key_sequences: list[str] = []
         self._resize_job = None   # debounce handle for canvas resize
+        self._is_fullscreen: bool = False
 
         self._build_ui()
         self._bind_keys()
@@ -140,6 +141,13 @@ class PDFViewer(tk.Tk):
         tk.Button(toolbar, text="⚙ Shortcuts", command=self._open_shortcuts_dialog,
                   **btn_cfg).pack(side=tk.LEFT, padx=2)
 
+        # Fullscreen toggle button
+        self.fullscreen_btn = tk.Button(
+            toolbar, text="⛶ Vollbild (F11)", command=self._toggle_fullscreen,
+            **btn_cfg
+        )
+        self.fullscreen_btn.pack(side=tk.LEFT, padx=2)
+
         # ── Status bar (bottom) ──────────────────────────────────────────────
         status_bar = tk.Frame(self, bg="#3c3f41", pady=3)
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
@@ -153,7 +161,8 @@ class PDFViewer(tk.Tk):
         hint = (
             "Shortcuts konfigurierbar (⚙ Shortcuts)  |  "
             "Mausrad = Scrollen  |  Strg+Mausrad = Zoom  |  "
-            "Mitteltaste/Rechtstaste + Ziehen = Verschieben"
+            "Mitteltaste/Rechtstaste + Ziehen = Verschieben  |  "
+            "F11 = Vollbild"
         )
         tk.Label(status_bar, text=hint, bg="#3c3f41", fg="#888888",
                  font=("Helvetica", 9)).pack(side=tk.RIGHT, padx=8)
@@ -293,6 +302,23 @@ class PDFViewer(tk.Tk):
         # Numpad keys are fixed (not configurable)
         self.bind("<KP_Add>",      guard(self._zoom_in))
         self.bind("<KP_Subtract>", guard(self._zoom_out))
+        # Fullscreen – always fixed, not affected by configurable shortcuts
+        self.bind("<F11>",   self._toggle_fullscreen)
+        self.bind("<Escape>", self._exit_fullscreen)
+
+    # ── Fullscreen ───────────────────────────────────────────────────────────
+
+    def _toggle_fullscreen(self, _event=None):
+        """Toggle fullscreen mode on/off (F11)."""
+        self._is_fullscreen = not self._is_fullscreen
+        self.attributes("-fullscreen", self._is_fullscreen)
+        label = "✕ Vollbild beenden (F11)" if self._is_fullscreen else "⛶ Vollbild (F11)"
+        self.fullscreen_btn.config(text=label)
+
+    def _exit_fullscreen(self, _event=None):
+        """Exit fullscreen mode (Escape)."""
+        if self._is_fullscreen:
+            self._toggle_fullscreen()
 
     def _on_page_entry(self, _event=None):
         """Navigate to the page number typed in the toolbar entry.
@@ -443,8 +469,12 @@ class PDFViewer(tk.Tk):
 
         self.canvas.config(scrollregion=(0, 0, scroll_w, scroll_h))
         self.canvas.create_image(x, y, anchor=tk.CENTER, image=self._tk_img)
-        self.canvas.xview_moveto(0)
-        self.canvas.yview_moveto(0)
+
+        # Scroll so that the image center aligns with the viewport center
+        x_frac = max(0.0, (x - canvas_w / 2) / scroll_w) if scroll_w else 0.0
+        y_frac = max(0.0, (y - canvas_h / 2) / scroll_h) if scroll_h else 0.0
+        self.canvas.xview_moveto(x_frac)
+        self.canvas.yview_moveto(y_frac)
 
         self._update_status()
         self._update_sidebar_selection()

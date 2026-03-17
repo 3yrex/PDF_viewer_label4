@@ -13,6 +13,9 @@ Features:
 - Page statistics panel (unlabeled / unwichtig / wichtig / sehr wichtig counts)
 - Configurable keyboard shortcuts dialog
 - Configurable settings dialog (auto-save threshold)
+- Anzeige / Helligkeit button: adjusts background and button brightness while
+  keeping text readable (WCAG-based contrast flip at luminance threshold)
+- Dark-styled scrollbars matching the Dracula theme (ttk custom style)
 - Dracula Theme color scheme, JetBrains Mono font
 """
 
@@ -88,6 +91,19 @@ SHORTCUT_LABELS: dict[str, str] = {
     "zoom_out":   "Zoom −",
 }
 
+# ── Brightness control ───────────────────────────────────────────────────────
+_DARK_FG       = "#1a1b2e"   # dark main text  (used when bg is bright)
+_DARK_MUTED    = "#20264e"   # dark muted text (used when bg is bright)
+_LUM_THRESHOLD = 0.25        # Background WCAG relative luminance above which dark text is used for contrast
+
+# Bidirectional fg remap for brightness transitions
+_FG_TO_DARK: dict[str, str] = {
+    DR_FG.lower():      _DARK_FG,
+    DR_COMMENT.lower(): _DARK_MUTED,
+}
+_FG_TO_LIGHT: dict[str, str] = {v: k for k, v in _FG_TO_DARK.items()}
+_ADAPTIVE_FG: frozenset[str] = frozenset(_FG_TO_DARK) | frozenset(_FG_TO_LIGHT)
+
 
 # ── Application ─────────────────────────────────────────────────────────────
 
@@ -111,6 +127,8 @@ class PDFViewer(tk.Tk):
         # Auto-save
         self.auto_save_threshold: int = DEFAULT_AUTO_SAVE_THRESHOLD
         self._labels_since_last_save: int = 0
+        # Brightness (1.0 = Dracula default; <1 darker; >1 lighter)
+        self._brightness: float = 1.0
 
         self._build_ui()
         self._bind_keys()
@@ -118,6 +136,11 @@ class PDFViewer(tk.Tk):
     # ── UI construction ──────────────────────────────────────────────────────
 
     def _build_ui(self):
+        # ── TTK dark scrollbar style ─────────────────────────────────────────
+        self._ttk_style = ttk.Style(self)
+        self._ttk_style.theme_use("clam")
+        self._apply_scrollbar_style(DR_BG, DR_SURFACE, DR_COMMENT, DR_FG)
+
         # ── Top toolbar ──────────────────────────────────────────────────────
         toolbar = tk.Frame(self, bg=DR_SURFACE, pady=4)
         toolbar.pack(side=tk.TOP, fill=tk.X)
@@ -174,6 +197,10 @@ class PDFViewer(tk.Tk):
         tk.Button(toolbar, text="⚙ Einstellungen", command=self._open_settings_dialog,
                   **btn_cfg).pack(side=tk.LEFT, padx=2)
 
+        # Brightness / display button
+        tk.Button(toolbar, text="☀ Anzeige", command=self._open_brightness_dialog,
+                  **btn_cfg).pack(side=tk.LEFT, padx=2)
+
         # Auto-save indicator
         self.autosave_label = tk.Label(
             toolbar, text="", bg=DR_SURFACE, fg=DR_GREEN,
@@ -223,7 +250,7 @@ class PDFViewer(tk.Tk):
         list_frame = tk.Frame(sidebar, bg=DR_SURFACE)
         list_frame.pack(fill=tk.BOTH, expand=True, padx=4)
 
-        sb_scroll = tk.Scrollbar(list_frame)
+        sb_scroll = ttk.Scrollbar(list_frame, style="Dark.Vertical.TScrollbar")
         sb_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
         self.page_listbox = tk.Listbox(
@@ -275,9 +302,10 @@ class PDFViewer(tk.Tk):
         canvas_frame = tk.Frame(main, bg=DR_BG)
         canvas_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        h_scroll = tk.Scrollbar(canvas_frame, orient=tk.HORIZONTAL)
+        h_scroll = ttk.Scrollbar(canvas_frame, orient=tk.HORIZONTAL,
+                                  style="Dark.Horizontal.TScrollbar")
         h_scroll.pack(side=tk.BOTTOM, fill=tk.X)
-        v_scroll = tk.Scrollbar(canvas_frame)
+        v_scroll = ttk.Scrollbar(canvas_frame, style="Dark.Vertical.TScrollbar")
         v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
         self.canvas = tk.Canvas(
@@ -347,6 +375,223 @@ class PDFViewer(tk.Tk):
         # Fullscreen – always fixed, not affected by configurable shortcuts
         self.bind("<F11>",   self._toggle_fullscreen)
         self.bind("<Escape>", self._exit_fullscreen)
+
+    # ── Color helpers & brightness ────────────────────────────────────────────
+
+    @staticmethod
+    def _scale_hex(hex_color: str, factor: float) -> str:
+        """Scale a hex color towards black (factor<1) or towards white (factor>1)."""
+        c = hex_color.lstrip("#")
+        r, g, b = int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+        if factor <= 1.0:
+            r, g, b = int(r * factor), int(g * factor), int(b * factor)
+        else:
+            f = factor - 1.0
+            r = int(r + (255 - r) * f)
+            g = int(g + (255 - g) * f)
+            b = int(b + (255 - b) * f)
+        r, g, b = max(0, min(255, r)), max(0, min(255, g)), max(0, min(255, b))
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    @staticmethod
+    def _relative_luminance(hex_color: str) -> float:
+        """Return WCAG relative luminance of a hex color (0 = black, 1 = white)."""
+        c = hex_color.lstrip("#")
+
+        def lin(v: int) -> float:
+            s = v / 255
+            return s / 12.92 if s <= 0.04045 else ((s + 0.055) / 1.055) ** 2.4
+
+        r, g, b = lin(int(c[0:2], 16)), lin(int(c[2:4], 16)), lin(int(c[4:6], 16))
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+    def _norm_color(self, raw: str) -> str:
+        """Normalise a widget color string to lowercase #rrggbb hex."""
+        s = raw.strip().lower()
+        if len(s) == 7 and s.startswith("#"):
+            return s
+        # Tk may return 12-digit hex on some platforms
+        if len(s) == 13 and s.startswith("#"):
+            return f"#{s[1:3]}{s[5:7]}{s[9:11]}"
+        try:
+            r, g, b = self.winfo_rgb(s)
+            return f"#{r // 256:02x}{g // 256:02x}{b // 256:02x}"
+        except Exception:
+            return s
+
+    def _adapt_fg(self, new_bg: str, cur_fg: str) -> str:
+        """Return a readable fg color for *new_bg*, flipping between the light
+        and dark variants of structural text colors as needed."""
+        cur_fg_n = cur_fg.lower()
+        if cur_fg_n not in _ADAPTIVE_FG:
+            return cur_fg
+        bright = self._relative_luminance(new_bg) > _LUM_THRESHOLD
+        if bright:
+            return _FG_TO_DARK.get(cur_fg_n, cur_fg)
+        return _FG_TO_LIGHT.get(cur_fg_n, cur_fg)
+
+    def _remap_colors(self, widget: tk.Widget, bg_map: dict[str, str]) -> None:
+        """Recursively remap structural bg/fg colors throughout a widget subtree."""
+        try:
+            cur_bg = self._norm_color(widget.cget("background"))
+            if cur_bg in bg_map:
+                new_bg = bg_map[cur_bg]
+                widget.config(background=new_bg)
+                # Adapt text-related attributes for readability
+                for attr in ("foreground", "insertbackground", "buttonbackground"):
+                    try:
+                        cur_fg = self._norm_color(widget.cget(attr))
+                        new_fg = self._adapt_fg(new_bg, cur_fg)
+                        if new_fg != cur_fg:
+                            widget.config(**{attr: new_fg})
+                    except (tk.TclError, AttributeError):
+                        pass
+                # Remap trough / active background where applicable
+                for attr in ("troughcolor", "activebackground"):
+                    try:
+                        cur_c = self._norm_color(widget.cget(attr))
+                        if cur_c in bg_map:
+                            widget.config(**{attr: bg_map[cur_c]})
+                    except (tk.TclError, AttributeError):
+                        pass
+        except (tk.TclError, AttributeError):
+            pass
+
+        for child in widget.winfo_children():
+            self._remap_colors(child, bg_map)
+
+    def _apply_scrollbar_style(
+        self, bg: str, surface: str, comment: str, fg: str
+    ) -> None:
+        """Configure the ttk dark scrollbar style for both orientations."""
+        for orient in ("Vertical", "Horizontal"):
+            name = f"Dark.{orient}.TScrollbar"
+            self._ttk_style.configure(
+                name,
+                gripcount=0,
+                background=comment,
+                darkcolor=bg,
+                lightcolor=surface,
+                troughcolor=bg,
+                bordercolor=bg,
+                arrowcolor=fg,
+            )
+            self._ttk_style.map(
+                name,
+                background=[("active", surface), ("pressed", surface)],
+                arrowcolor=[("disabled", comment)],
+            )
+
+    def _apply_brightness(
+        self, factor: float, extra: "tk.Widget | None" = None
+    ) -> None:
+        """Apply brightness *factor* (0.3 = very dark … 1.5 = lighter) to all
+        structural UI colors in the main window and optionally an extra widget."""
+        old_bg      = self._scale_hex(DR_BG,      self._brightness)
+        old_surface = self._scale_hex(DR_SURFACE,  self._brightness)
+        old_comment = self._scale_hex(DR_COMMENT,  self._brightness)
+
+        new_bg      = self._scale_hex(DR_BG,      factor)
+        new_surface = self._scale_hex(DR_SURFACE,  factor)
+        new_comment = self._scale_hex(DR_COMMENT,  factor)
+
+        bg_map: dict[str, str] = {}
+        if old_bg      != new_bg:      bg_map[old_bg]      = new_bg
+        if old_surface != new_surface: bg_map[old_surface] = new_surface
+        if old_comment != new_comment: bg_map[old_comment] = new_comment
+
+        if bg_map:
+            self._remap_colors(self, bg_map)
+            if extra is not None:
+                self._remap_colors(extra, bg_map)
+
+        # Update listbox item fgs for unlabeled pages
+        if self.doc:
+            muted = self._adapt_fg(new_bg, DR_COMMENT)
+            for i in range(len(self.doc)):
+                if self.labels.get(i, 0) == 0:
+                    self.page_listbox.itemconfig(i, fg=muted)
+
+        # Update ttk scrollbar palette to match new colors
+        new_fg = _DARK_FG if self._relative_luminance(new_bg) > _LUM_THRESHOLD else DR_FG
+        self._apply_scrollbar_style(new_bg, new_surface, new_comment, new_fg)
+
+        self._brightness = factor
+
+    # ── Brightness dialog ─────────────────────────────────────────────────────
+
+    def _open_brightness_dialog(self) -> None:
+        """Open a dialog with a slider to adjust UI brightness."""
+        dlg = tk.Toplevel(self)
+        dlg.title("Anzeige – Helligkeit")
+        dlg.geometry("400x180")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        _FACTOR_MIN, _FACTOR_MAX = 0.3, 1.5
+
+        def factor_to_slider(f: float) -> int:
+            return round((f - _FACTOR_MIN) / (_FACTOR_MAX - _FACTOR_MIN) * 100)
+
+        def slider_to_factor(v: int) -> float:
+            return _FACTOR_MIN + (v / 100) * (_FACTOR_MAX - _FACTOR_MIN)
+
+        cur_bg  = self._scale_hex(DR_BG,      self._brightness)
+        cur_sfc = self._scale_hex(DR_SURFACE,  self._brightness)
+        cur_cmt = self._scale_hex(DR_COMMENT,  self._brightness)
+        cur_fg  = _DARK_FG if self._relative_luminance(cur_bg) > _LUM_THRESHOLD else DR_FG
+
+        dlg.configure(bg=cur_bg)
+
+        tk.Label(dlg, text="☀ Helligkeit anpassen", bg=cur_bg, fg=cur_fg,
+                 font=(FONT_FAMILY, 12, "bold")).pack(pady=(16, 8))
+
+        row = tk.Frame(dlg, bg=cur_bg)
+        row.pack(fill=tk.X, padx=24, pady=4)
+
+        tk.Label(row, text="🌑", bg=cur_bg, fg=cur_fg,
+                 font=(FONT_FAMILY, 11)).pack(side=tk.LEFT)
+
+        slider_var = tk.IntVar(value=factor_to_slider(self._brightness))
+
+        _slider_job: "int | None" = None
+
+        def on_slider(v: str) -> None:
+            nonlocal _slider_job
+            if _slider_job is not None:
+                dlg.after_cancel(_slider_job)
+            _slider_job = dlg.after(
+                40, lambda: self._apply_brightness(slider_to_factor(int(v)), dlg)
+            )
+
+        slider = tk.Scale(
+            row, from_=0, to=100, orient=tk.HORIZONTAL,
+            variable=slider_var, showvalue=False,
+            bg=cur_sfc, fg=cur_fg, troughcolor=cur_cmt,
+            highlightthickness=0,
+            command=on_slider,
+        )
+        slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+
+        tk.Label(row, text="☀", bg=cur_bg, fg=cur_fg,
+                 font=(FONT_FAMILY, 11)).pack(side=tk.LEFT)
+
+        btn_row = tk.Frame(dlg, bg=cur_bg)
+        btn_row.pack(pady=14)
+
+        def reset() -> None:
+            slider_var.set(factor_to_slider(1.0))
+            self._apply_brightness(1.0, dlg)
+
+        tk.Button(btn_row, text="Standard", command=reset,
+                  bg=cur_cmt, fg=cur_fg, relief=tk.FLAT,
+                  padx=10, pady=4, cursor="hand2",
+                  font=(FONT_FAMILY, 9)).pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_row, text="Schließen", command=dlg.destroy,
+                  bg=cur_cmt, fg=cur_fg, relief=tk.FLAT,
+                  padx=10, pady=4, cursor="hand2",
+                  font=(FONT_FAMILY, 9)).pack(side=tk.LEFT, padx=6)
 
     # ── Fullscreen ───────────────────────────────────────────────────────────
 
@@ -533,7 +778,9 @@ class PDFViewer(tk.Tk):
         lbl_text = LABELS[lbl_key]
         color = LABEL_COLORS[lbl_key]
         if lbl_key == 0:
-            self.label_badge.config(text="[kein Label]", bg=DR_SURFACE, fg=DR_COMMENT)
+            sfc = self._scale_hex(DR_SURFACE, self._brightness)
+            muted_fg = self._adapt_fg(sfc, DR_COMMENT)
+            self.label_badge.config(text="[kein Label]", bg=sfc, fg=muted_fg)
         else:
             self.label_badge.config(text=f"[{lbl_text}]", bg=color, fg=DR_BG)
         self.zoom_label.config(text=f"{int(self.zoom * 100)} %")
@@ -558,13 +805,15 @@ class PDFViewer(tk.Tk):
         if not self.doc:
             self._update_stats()
             return
+        lb_bg = self._scale_hex(DR_BG, self._brightness)
+        muted_fg = self._adapt_fg(lb_bg, DR_COMMENT)
         for i in range(len(self.doc)):
             lbl_key = self.labels.get(i, 0)
             prefix = {0: "  ", 1: "✗ ", 2: "★ ", 3: "★★"}[lbl_key]
             color = LABEL_COLORS[lbl_key]
             entry = f"{prefix}Seite {i + 1}"
             self.page_listbox.insert(tk.END, entry)
-            self.page_listbox.itemconfig(i, fg=color if lbl_key else DR_COMMENT)
+            self.page_listbox.itemconfig(i, fg=color if lbl_key else muted_fg)
         self._update_stats()
 
     def _update_sidebar_selection(self):
@@ -608,7 +857,9 @@ class PDFViewer(tk.Tk):
         self.page_listbox.delete(self.current_page)
         self.page_listbox.insert(self.current_page, f"{prefix}Seite {self.current_page + 1}")
         color = LABEL_COLORS[lbl_key]
-        self.page_listbox.itemconfig(self.current_page, fg=color if lbl_key else DR_COMMENT)
+        lb_bg = self._scale_hex(DR_BG, self._brightness)
+        muted_fg = self._adapt_fg(lb_bg, DR_COMMENT)
+        self.page_listbox.itemconfig(self.current_page, fg=color if lbl_key else muted_fg)
         self._update_sidebar_selection()
         self._update_stats()
         # Auto-save counter: only count actual label assignments (not removals)

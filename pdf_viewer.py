@@ -84,6 +84,7 @@ class PDFViewer(tk.Tk):
         self.labels: dict[int, int] = {}   # page_index → label key (0–3)
         self.shortcuts: dict[str, str] = dict(DEFAULT_SHORTCUTS)
         self._bound_key_sequences: list[str] = []
+        self._resize_job = None   # debounce handle for canvas resize
 
         self._build_ui()
         self._bind_keys()
@@ -252,6 +253,9 @@ class PDFViewer(tk.Tk):
         self.canvas.bind("<Control-MouseWheel>", self._on_ctrl_wheel) # Windows zoom
         self.canvas.bind("<Control-Button-4>", self._on_ctrl_wheel)   # Linux zoom up
         self.canvas.bind("<Control-Button-5>", self._on_ctrl_wheel)   # Linux zoom down
+
+        # Re-center the page whenever the canvas is resized (debounced)
+        self.canvas.bind("<Configure>", self._on_canvas_resize)
 
     def _bind_keys(self):
         # Unbind previously registered shortcuts
@@ -424,8 +428,21 @@ class PDFViewer(tk.Tk):
         self._tk_img = ImageTk.PhotoImage(img)
 
         self.canvas.delete("all")
-        self.canvas.config(scrollregion=(0, 0, pix.width, pix.height))
-        self.canvas.create_image(0, 0, anchor=tk.NW, image=self._tk_img)
+
+        # Ensure layout is up-to-date before reading canvas dimensions
+        self.canvas.update_idletasks()
+        canvas_w = self.canvas.winfo_width()
+        canvas_h = self.canvas.winfo_height()
+
+        # Center the image; add small margin (10 px) around it
+        margin = 10
+        x = max(canvas_w // 2, pix.width // 2 + margin)
+        y = max(canvas_h // 2, pix.height // 2 + margin)
+        scroll_w = max(canvas_w, pix.width + 2 * margin)
+        scroll_h = max(canvas_h, pix.height + 2 * margin)
+
+        self.canvas.config(scrollregion=(0, 0, scroll_w, scroll_h))
+        self.canvas.create_image(x, y, anchor=tk.CENTER, image=self._tk_img)
         self.canvas.xview_moveto(0)
         self.canvas.yview_moveto(0)
 
@@ -538,6 +555,12 @@ class PDFViewer(tk.Tk):
     def _zoom_reset(self):
         self.zoom = DEFAULT_ZOOM
         self._show_page()
+
+    def _on_canvas_resize(self, _event=None):
+        """Re-render the current page after a short debounce delay."""
+        if self._resize_job is not None:
+            self.after_cancel(self._resize_job)
+        self._resize_job = self.after(50, self._show_page)
 
     def _on_mousewheel(self, event):
         if not self.doc:
